@@ -1042,8 +1042,9 @@ void stream4_shard_job_device_threshold_cuda(
 #if CUDART_VERSION >= 12040
     cudaStreamCaptureStatus capture_status;
     cudaGraph_t parent = nullptr;
-    check_cub(cudaStreamGetCaptureInfo_v2(stream, &capture_status, nullptr,
-        &parent, nullptr, nullptr), "stream4 conditional parent");
+    check_cub(cudaStreamGetCaptureInfo(stream, &capture_status, nullptr,
+                                     &parent, nullptr, nullptr, nullptr),
+              "stream4 conditional parent");
     if (capture_status != cudaStreamCaptureStatusActive)
         throw std::invalid_argument("bounded Stream4 requires graph capture");
     cudaGraphConditionalHandle handles[3];
@@ -1064,9 +1065,12 @@ void stream4_shard_job_device_threshold_cuda(
     // scratch slot and are chained; mutual exclusion is decided on the GPU.
     for (unsigned alternative = 0; alternative < 3; ++alternative) {
         const cudaGraphNode_t* dependencies = nullptr;
+        const cudaGraphEdgeData* dependency_data = nullptr;
         std::size_t dependency_count = 0;
-        check_cub(cudaStreamGetCaptureInfo_v2(stream, &capture_status, nullptr,
-            &parent, &dependencies, &dependency_count), "stream4 conditional dependencies");
+        check_cub(cudaStreamGetCaptureInfo(stream, &capture_status, nullptr,
+                                           &parent, &dependencies,
+                                           &dependency_data, &dependency_count),
+                  "stream4 conditional dependencies");
         cudaGraphNodeParams parameters{};
         parameters.type = cudaGraphNodeTypeConditional;
         parameters.conditional.handle = handles[alternative];
@@ -1074,7 +1078,9 @@ void stream4_shard_job_device_threshold_cuda(
         parameters.conditional.size = 1;
         cudaGraphNode_t conditional;
         check_cub(cudaGraphAddNode(&conditional, parent, dependencies,
-            dependency_count, &parameters), "stream4 conditional node");
+                                   dependency_data, dependency_count,
+                                   &parameters),
+                  "stream4 conditional node");
         cudaStream_t body_stream = nullptr;
         check_cub(cudaStreamCreateWithFlags(&body_stream, cudaStreamNonBlocking), "stream4 body stream");
         try {
@@ -1092,8 +1098,10 @@ void stream4_shard_job_device_threshold_cuda(
             cudaStreamDestroy(body_stream);
             throw;
         }
-        check_cub(cudaStreamUpdateCaptureDependencies(stream, &conditional, 1,
-            cudaStreamSetCaptureDependencies), "stream4 conditional continuation");
+        check_cub(cudaStreamUpdateCaptureDependencies(
+                      stream, &conditional, nullptr, 1,
+                      cudaStreamSetCaptureDependencies),
+                  "stream4 conditional continuation");
     }
 #else
     throw std::invalid_argument("bounded Stream4 requires CUDA 12.4 or newer");

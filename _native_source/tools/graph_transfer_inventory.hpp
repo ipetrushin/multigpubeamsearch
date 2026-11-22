@@ -95,10 +95,12 @@ public:
         std::size_t edge_count=0;
         // NULL edgeData requires default zeroed dependency semantics; a lossy
         // query (programmatic/non-default edges) is rejected by CUDA itself.
-        BEAM_CUDA_CHECK(cudaGraphGetEdges_v2(graph,nullptr,nullptr,nullptr,&edge_count));
+        BEAM_CUDA_CHECK(cudaGraphGetEdges(graph, nullptr, nullptr, nullptr, &edge_count));
+        //BEAM_CUDA_CHECK(cudaGraphGetEdges_v2(graph,nullptr,nullptr,nullptr,&edge_count));
         if(edge_count>262144)throw std::runtime_error("graph dependency edge bound exceeded");
         std::vector<cudaGraphNode_t> from(edge_count),to(edge_count);
-        if(edge_count)BEAM_CUDA_CHECK(cudaGraphGetEdges_v2(graph,from.data(),to.data(),nullptr,&edge_count));
+        BEAM_CUDA_CHECK(cudaGraphGetEdges(graph, from.data(), to.data(), nullptr, &edge_count));
+        //if(edge_count)BEAM_CUDA_CHECK(cudaGraphGetEdges_v2(graph,from.data(),to.data(),nullptr,&edge_count));
         if(edge_count!=from.size())throw std::runtime_error("graph dependencies changed during enumeration");
         auto edges=nlohmann::json::array();
         for(std::size_t i=0;i<edge_count;++i) {
