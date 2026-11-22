@@ -1,0 +1,253 @@
+"""Small, exhaustive reference for issue #6 receipts. Run directly or under torchrun."""
+import argparse
+from contextlib import nullcontext
+import hashlib
+import json
+from pathlib import Path
+import socket
+import struct
+
+import torch
+import torch.distributed as dist
+
+from multigpubeamsearch.cnot import pack_rows, replay_cnot, search_cnot
+from multigpubeamsearch.cnot_cli import initialize_world
+from multigpubeamsearch.cnot_collectives import World
+from multigpubeamsearch.cnot_scorer import TQPScorer
+
+
+def rows_of(lanes, n):
+    words = (n + 63) // 64
+    return tuple(sum((lanes[i + j] % (1 << 64)) << (64 * j) for j in range(words))
+                 for i in range(0, len(lanes), words))
+
+
+def gate_pairs(n):
+    return [(source, target) for source in range(n) for target in range(n) if target != source]
+
+
+def apply(rows, pair):
+    c, t = pair
+    result = list(rows)
+    result[t] ^= result[c]
+    return tuple(result)
+
+
+def float_value(bits):
+    return struct.unpack("=d", struct.pack("=q", bits))[0]
+
+
+def require(condition, message):
+    if not condition:
+        raise AssertionError(message)
+
+
+def small_exact_distance(target, pairs, bound):
+    start = tuple(1 << i for i in range(len(target)))
+    frontier, seen = {start}, {start}
+    for depth in range(bound + 1):
+        if target in frontier:
+            return depth
+        if depth < bound:
+            frontier = {apply(rows, pair) for rows in frontier for pair in pairs} - seen
+            seen.update(frontier)
+    raise AssertionError("target is outside the exact BFS ball")
+
+
+def verify_layers(root, scorer, mode, width, k, layers, device):
+    """Enumerate on Python integers. Compare the entire eligible union, path representatives,
+    measured values, and every ordered survivor against the independent single-beam result."""
+    n, closed = len(root), {root}
+    pairs = gate_pairs(n)
+    parents = [(root, ())]
+    reports = []
+    for layer in layers:
+        if k < len(pairs):
+            batch = torch.cat([pack_rows(rows, device=device) for rows, word in parents])
+            head = scorer.parent_scores(batch, mode).tolist()
+        eligible = {}
+        for i, (rows, word) in enumerate(parents):
+            actions = range(len(pairs))
+            if k < len(pairs):
+                actions = sorted(actions, key=lambda a: head[i][a], reverse=mode == "proposal")[:k]
+            for action in actions:
+                child = apply(rows, pairs[action])
+                if child not in closed:
+                    eligible.setdefault(child, (i, word + (action,)))
+        measured = {}
+        for bits, parent, _lex, _generation, route, *lanes in layer["candidates"]:
+            child = rows_of(lanes, n)
+            require(child not in measured and child in eligible, "duplicate or extraneous child")
+            i, word = eligible[child]
+            require(parent == i and (route & 65535) == word[-1], "wrong stable representative")
+            measured[child] = float_value(bits)
+        require(set(measured) == set(eligible), "candidate missing from the global union")
+        if measured:
+            children = torch.cat([pack_rows(rows, device=device) for rows in measured])
+            actual = scorer.child_values(children).double().cpu()
+            torch.testing.assert_close(actual, torch.tensor(list(measured.values()), dtype=torch.float64),
+                                       rtol=1e-6, atol=1e-7)
+        expected = sorted(eligible, key=lambda rows: (measured[rows], eligible[rows][1]))[:width]
+        winners = [rows_of(item[5:], n) for item in layer["winners"]]
+        require(winners == expected, "global top B differs")
+        digest = hashlib.sha256(json.dumps(winners, separators=(",", ":")).encode()).hexdigest()
+        reports.append(dict(depth=layer["depth"], distinct=len(eligible), retained=len(winners),
+                            winners_sha256=digest, by_rank=layer["by_rank"]))
+        parents = [(rows, eligible[rows][1]) for rows in expected]
+        closed.update(winners)
+    return reports
+
+
+class WireFixture:
+    """Diagnostic scores forcing one wide routed move; never used as the project model."""
+    def __init__(self, undo):
+        self.undo = undo
+
+    def parent_scores(self, packed, mode):
+        alphabet = packed.size(1) * (packed.size(1) - 1)
+        q = torch.arange(alphabet, device=packed.device, dtype=torch.float64)
+        q[self.undo] = -1
+        return (q if mode == "qhat" else -q).expand(len(packed), -1)
+
+    def child_values(self, children):
+        # Popcount distance to the identity, using an independent byte lookup.
+        n = children.size(1)
+        eye = pack_rows([1 << j for j in range(n)], device=children.device)
+        diff = (children ^ eye).contiguous().view(torch.uint8).reshape(len(children), -1).long()
+        lut = torch.tensor([i.bit_count() for i in range(256)], device=children.device)
+        return lut[diff].sum(1).double()
+
+
+def wide_case():
+    n = 144
+    first, second = 130 * 143 + 2, 2 * 143 + 142
+    return replay_cnot(n, (first, second)), WireFixture(second)
+
+
+def validate_case(rows, scorer, mode, width, k, depth, device, require_cross_rank=False, engine="auto"):
+    result = search_cnot(pack_rows(rows, device=device), scorer, width=width, shortlist=k,
+                         max_depth=depth, mode=mode, audit=True, engine=engine)
+    with World(device) as world:
+        def inspect():
+            if world.rank:
+                return None
+            layers = verify_layers(rows, scorer, mode, width, k, result.layers, device)
+            require(result.status == "solved", f"expected a solution, got {result.status}")
+            pairs = gate_pairs(len(rows))
+            replay = tuple(1 << i for i in range(len(rows)))
+            for action in result.gates:
+                replay = apply(replay, pairs[action])
+            require(replay == rows, "independent construction does not match the input")
+            if require_cross_rank and world.size > 1:
+                require(any(edge["move"] > 255 and len({edge["source"], edge["hash_owner"], edge["target"]}) > 1
+                            for edge in result.path_routes), "large physical move never crossed a rank")
+            require(any(layer["distinct"] > width and layer["retained"] == width and
+                        (world.size == 1 or sum(rank[3] > 0 for rank in layer["by_rank"]) >= 2)
+                        for layer in layers), "missing a saturated layer with participating owners")
+            report = dict(n=len(rows), width=width, shortlist=k, mode=mode, world=world.size,
+                          scorer=type(scorer).__name__,
+                          scorer_runtime=f"{type(scorer).__module__}.{type(scorer).__qualname__}",
+                          engine=engine, model=getattr(scorer, "metadata", None),
+                          layers=layers, physical_ids=list(result.gates), directed_gates=[pairs[i] for i in result.gates],
+                          length=result.length, bitwise_replay=True, routes=result.path_routes)
+            if len(rows) == 4 and result.length <= 3:
+                report["exact_distance_bfs"] = small_exact_distance(rows, pairs, result.length)
+            return report
+        return world.checked("independent validation", inspect)
+
+
+def validate_distribution(device, engine="auto"):
+    """Exercise every rank as a parent source, value owner and frontier recipient."""
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    n = 6
+    rows = tuple(1 << i for i in reversed(range(n)))
+    width, k = 17, 25
+    if world_size > width:
+        raise ValueError("this small all-rank fixture covers up to 17 workers")
+    scorer = WireFixture(29)
+    result = search_cnot(pack_rows(rows, device=device), scorer, width=width, shortlist=k,
+                         max_depth=3, audit=True, engine=engine)
+    with World(device) as world:
+        def inspect():
+            if world.rank:
+                return None
+            layers = verify_layers(rows, scorer, "qhat", width, k, result.layers, device)
+            require(len(layers) == 2, "expected two complete expansions before the depth bound")
+            per_rank = layers[1]["by_rank"]
+            require(all(row[0] and row[3] and row[4] for row in per_rank),
+                    "a rank did not expand parents, score distinct candidates or retain winners")
+            require(layers[1]["retained"] == width and layers[1]["distinct"] > width, "unsaturated frontier")
+            return dict(n=n, width=width, shortlist=k, mode="qhat", world=world.size,
+                        scorer=type(scorer).__name__, engine=engine, status=result.status, layers=layers)
+        return world.checked("all-rank validation", inspect)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--case", choices=("trained", "trained-deep", "wide", "topology"), required=True)
+    parser.add_argument("--backend", choices=("nccl", "gloo"), default="nccl")
+    parser.add_argument("--mode", choices=("qhat", "proposal"), default="qhat")
+    parser.add_argument("--width", type=int)
+    parser.add_argument("--library")
+    parser.add_argument("--manifest")
+    parser.add_argument("--engine", choices=("auto", "python", "rust"), default="auto",
+                        help="select the search controller; rust fails closed when unavailable")
+    parser.add_argument("--require-rust-scorer", action="store_true",
+                        help="require the Rust-owned checkpoint scorer and Rust controller")
+    parser.add_argument("--output", required=True, type=Path)
+    args = parser.parse_args()
+    if args.require_rust_scorer:
+        if args.case not in ("trained", "trained-deep"):
+            parser.error("--require-rust-scorer requires a trained checkpoint case")
+        if args.engine == "python":
+            parser.error("--require-rust-scorer cannot be combined with --engine python")
+        args.engine = "rust"
+    device = initialize_world(args.backend)
+    world = World(device)
+    try:
+        if args.case in ("trained", "trained-deep"):
+            rows, k, default_width = ((1, 7, 4, 10), 3, 2) if args.case == "trained-deep" else ((1, 2, 7, 8), 11, 8)
+            width = default_width if args.width is None else args.width
+            context = world.checked("load trained scorer", lambda:
+                TQPScorer(args.library, args.manifest, n=len(rows), device=device, inference_batch=4))
+        elif args.case == "wide":
+            rows, scorer = wide_case()
+            context, k, width = nullcontext(scorer), 3, 1 if args.width is None else args.width
+        else:
+            context = nullcontext()
+        with context as scorer:
+            if args.require_rust_scorer:
+                def require_native_scorer():
+                    from multigpubeamsearch.cnot_scorer import _rust_tqp_scorer
+                    native_type = _rust_tqp_scorer()
+                    require(native_type is not None and type(scorer) is native_type,
+                            "Rust-owned checkpoint scorer is required")
+                world.checked("verify Rust-owned checkpoint scorer", require_native_scorer)
+            output = (validate_distribution(device, args.engine) if args.case == "topology" else
+                      validate_case(rows, scorer, args.mode, width, k, 3, device,
+                                    args.case == "wide", engine=args.engine))
+            if args.case == "trained-deep" and world.size == 2:
+                def check_participation():
+                    if world.rank == 0:
+                        require(any(all(rank[0] and rank[3] and rank[4] for rank in layer["by_rank"])
+                                    and layer["distinct"] > layer["retained"] == width for layer in output["layers"]),
+                                "both GPUs must expand, score and retain in the same saturated layer")
+                world.checked("trained layer participation", check_participation)
+            hardware = dict(rank=world.rank, host=socket.gethostname(), device=str(device),
+                            gpu=torch.cuda.get_device_name(device) if device.type == "cuda" else None)
+            devices = [None] * world.size
+            if world.size > 1:
+                dist.all_gather_object(devices, hardware)
+            else:
+                devices[0] = hardware
+            if world.rank == 0:
+                output.update(devices=devices, torch=str(torch.__version__), backend=args.backend)
+                args.output.write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
+                print(json.dumps(output), flush=True)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
